@@ -106,7 +106,7 @@ def _format_chatml(
 
 @dataclasses.dataclass
 class ChatFormatterResponse:
-    prompt: str
+    prompt: list
     stop: Optional[Union[str, List[str]]] = None
 
 

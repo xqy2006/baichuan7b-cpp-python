@@ -1657,23 +1657,29 @@ class Llama:
             Generated chat completion or a stream of chat completion chunks.
         """
 
-        format = llama_chat_format.get_chat_format(self.chat_format)
-        result = format(
-            messages=messages,
-        )
-        prompt = result.prompt
-        if result.stop is not None:
-            stop = [] if stop is None else [stop] if isinstance(stop, str) else stop
-            rstop = result.stop if isinstance(result.stop, list) else [result.stop]
-            stop = stop + rstop
-
+        stop = [] if stop is None else [stop] if isinstance(stop, str) else stop
+        rstop = result.stop if isinstance(result.stop, list) else [result.stop]
+        stop = stop + rstop
+        PROMPT = []
+        for message in messages:
+            if message["role"] == "user":
+                PROMPT.append(195)
+                PROMPT.append(message["content"])
+            else:
+                PROMPT.append(196)
+                PROMPT.append(message["content"])
+                PROMPT.append(2)
+        PROMPT.append(196)
+        #PROMPT = "[" + chat_history[2:] + "\",196]"
+        #PROMPT = PROMPT.replace("\n","\\n")
+        PROMPT_STOP = ["<reserved_103> ", "<reserved_102> ","<reserved_106> ", "<reserved_107> "]
         completion_or_chunks = self.create_completion(
-            prompt=prompt,
+            prompt=PROMPT,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             stream=stream,
-            stop=stop,
+            stop=PROMPT_STOP + stop,
             max_tokens=max_tokens,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
