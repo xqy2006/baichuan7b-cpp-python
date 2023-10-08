@@ -30,7 +30,7 @@ conda activate llama
     *(you needed xcode installed in order pip to build/compile the C++ code)*
 ```
 pip uninstall llama-cpp-python -y
-CMAKE_ARGS="-DLLAMA_METAL=on" FORCE_CMAKE=1 pip install -U llama-cpp-python --no-cache-dir
+CMAKE_ARGS="-DLLAMA_METAL=on" pip install -U llama-cpp-python --no-cache-dir
 pip install 'llama-cpp-python[server]'
 
 # you should now have llama-cpp-python v0.1.62 or higher installed
@@ -38,19 +38,19 @@ llama-cpp-python         0.1.68
 
 ```
 
-**(5) Download a v3 ggml model**
- - **ggmlv3**
- - file name ends with **q4_0.bin** - indicating it is 4bit quantized, with quantisation method 0
+**(5) Download a v3 gguf v2 model**
+ - **ggufv2**
+ - file name ends with **Q4_0.gguf** - indicating it is 4bit quantized, with quantisation method 0
 
-https://huggingface.co/TheBloke/open-llama-7b-open-instruct-GGML
+https://huggingface.co/TheBloke/CodeLlama-7B-GGUF
 
 
 **(6) run the llama-cpp-python API server with MacOS Metal GPU support**
 ```
 # config your ggml model path
-# make sure it is ggml v3
+# make sure it is gguf v2
 # make sure it is q4_0
-export MODEL=[path to your llama.cpp ggml models]]/[ggml-model-name]]q4_0.bin
+export MODEL=[path to your llama.cpp ggml models]]/[ggml-model-name]]Q4_0.gguf
 python3 -m llama_cpp.server --model $MODEL  --n_gpu_layers 1
 ```
 

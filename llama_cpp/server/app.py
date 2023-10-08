@@ -1,8 +1,11 @@
+import sys
 import json
 import multiprocessing
+import time
+from re import compile, Match, Pattern
 from threading import Lock
 from functools import partial
-from typing import Iterator, List, Optional, Union, Dict
+from typing import Callable, Coroutine, Iterator, List, Optional, Tuple, Union, Dict
 from typing_extensions import TypedDict, Literal
 
 import llama_cpp
@@ -10,11 +13,23 @@ import llama_cpp
 import anyio
 from anyio.streams.memory import MemoryObjectSendStream
 from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
-from fastapi import Depends, FastAPI, APIRouter, Request
+from fastapi import Depends, FastAPI, APIRouter, Request, Response
+from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from sse_starlette.sse import EventSourceResponse
+from starlette_context import plugins
+from starlette_context.middleware import RawContextMiddleware
+
+import numpy as np
+import numpy.typing as npt
+
+
+# Disable warning for model and model_alias settings
+BaseSettings.model_config['protected_namespaces'] = ()
 
 
 class Settings(BaseSettings):
@@ -25,49 +40,74 @@ class Settings(BaseSettings):
         default=None,
         description="The alias of the model to use for generating completions.",
     )
+    seed: int = Field(default=llama_cpp.LLAMA_DEFAULT_SEED, description="Random seed. -1 for random.")
     n_ctx: int = Field(default=2048, ge=1, description="The context size.")
+    n_batch: int = Field(
+        default=512, ge=1, description="The batch size to use per eval."
+    )
     n_gpu_layers: int = Field(
         default=0,
         ge=0,
         description="The number of layers to put on the GPU. The rest will be on the CPU.",
     )
+    main_gpu: int = Field(
+        default=0,
+        ge=0,
+        description="Main GPU to use.",
+    )
     tensor_split: Optional[List[float]] = Field(
         default=None,
         description="Split layers across multiple GPUs in proportion.",
     )
-    rope_freq_base: float = Field(default=10000, ge=1, description="RoPE base frequency")
-    rope_freq_scale: float = Field(default=1.0, description="RoPE frequency scaling factor")
-    seed: int = Field(
-        default=1337, description="Random seed. -1 for random."
+    rope_freq_base: float = Field(
+        default=0.0, description="RoPE base frequency"
     )
-    n_batch: int = Field(
-        default=512, ge=1, description="The batch size to use per eval."
+    rope_freq_scale: float = Field(
+        default=0.0, description="RoPE frequency scaling factor"
     )
-    n_threads: int = Field(
-        default=max(multiprocessing.cpu_count() // 2, 1),
-        ge=1,
-        description="The number of threads to use.",
+    mul_mat_q: bool = Field(
+        default=True, description="if true, use experimental mul_mat_q kernels"
     )
     f16_kv: bool = Field(default=True, description="Whether to use f16 key/value.")
-    use_mlock: bool = Field(
-        default=llama_cpp.llama_mlock_supported(),
-        description="Use mlock.",
+    logits_all: bool = Field(default=True, description="Whether to return logits.")
+    vocab_only: bool = Field(
+        default=False, description="Whether to only return the vocabulary."
     )
     use_mmap: bool = Field(
         default=llama_cpp.llama_mmap_supported(),
         description="Use mmap.",
     )
+    use_mlock: bool = Field(
+        default=llama_cpp.llama_mlock_supported(),
+        description="Use mlock.",
+    )
     embedding: bool = Field(default=True, description="Whether to use embeddings.")
-    low_vram: bool = Field(
-        default=False,
-        description="Whether to use less VRAM. This will reduce performance.",
+    n_threads: int = Field(
+        default=max(multiprocessing.cpu_count() // 2, 1),
+        ge=1,
+        description="The number of threads to use.",
     )
     last_n_tokens_size: int = Field(
         default=64,
         ge=0,
         description="Last n tokens to keep for repeat penalty calculation.",
     )
-    logits_all: bool = Field(default=True, description="Whether to return logits.")
+    lora_base: Optional[str] = Field(
+        default=None,
+        description="Optional path to base model, useful if using a quantized base model and you want to apply LoRA to an f16 model."
+    )
+    lora_path: Optional[str] = Field(
+        default=None,
+        description="Path to a LoRA file to apply to the model.",
+    )
+    numa: bool = Field(
+        default=False,
+        description="Enable NUMA support.",
+    )
+    chat_format: str = Field(
+        default="llama-2",
+        description="Chat format to use.",
+    )
     cache: bool = Field(
         default=False,
         description="Use a cache to reduce processing times for evaluated prompts.",
@@ -80,9 +120,6 @@ class Settings(BaseSettings):
         default=2 << 30,
         description="The size of the cache in bytes. Only used if cache is True.",
     )
-    vocab_only: bool = Field(
-        default=False, description="Whether to only return the vocabulary."
-    )
     verbose: bool = Field(
         default=True, description="Whether to print debug information."
     )
@@ -94,7 +131,190 @@ class Settings(BaseSettings):
     )
 
 
-router = APIRouter()
+class ErrorResponse(TypedDict):
+    """OpenAI style error response"""
+
+    message: str
+    type: str
+    param: Optional[str]
+    code: Optional[str]
+
+
+class ErrorResponseFormatters:
+    """Collection of formatters for error responses.
+
+    Args:
+        request (Union[CreateCompletionRequest, CreateChatCompletionRequest]):
+            Request body
+        match (Match[str]): Match object from regex pattern
+
+    Returns:
+        Tuple[int, ErrorResponse]: Status code and error response
+    """
+
+    @staticmethod
+    def context_length_exceeded(
+        request: Union["CreateCompletionRequest", "CreateChatCompletionRequest"],
+        match,  # type: Match[str] # type: ignore
+    ) -> Tuple[int, ErrorResponse]:
+        """Formatter for context length exceeded error"""
+
+        context_window = int(match.group(2))
+        prompt_tokens = int(match.group(1))
+        completion_tokens = request.max_tokens
+        if hasattr(request, "messages"):
+            # Chat completion
+            message = (
+                "This model's maximum context length is {} tokens. "
+                "However, you requested {} tokens "
+                "({} in the messages, {} in the completion). "
+                "Please reduce the length of the messages or completion."
+            )
+        else:
+            # Text completion
+            message = (
+                "This model's maximum context length is {} tokens, "
+                "however you requested {} tokens "
+                "({} in your prompt; {} for the completion). "
+                "Please reduce your prompt; or completion length."
+            )
+        return 400, ErrorResponse(
+            message=message.format(
+                context_window,
+                completion_tokens + prompt_tokens,
+                prompt_tokens,
+                completion_tokens,
+            ),
+            type="invalid_request_error",
+            param="messages",
+            code="context_length_exceeded",
+        )
+
+    @staticmethod
+    def model_not_found(
+        request: Union["CreateCompletionRequest", "CreateChatCompletionRequest"],
+        match,  # type: Match[str] # type: ignore
+    ) -> Tuple[int, ErrorResponse]:
+        """Formatter for model_not_found error"""
+
+        model_path = str(match.group(1))
+        message = f"The model `{model_path}` does not exist"
+        return 400, ErrorResponse(
+            message=message,
+            type="invalid_request_error",
+            param=None,
+            code="model_not_found",
+        )
+
+
+class RouteErrorHandler(APIRoute):
+    """Custom APIRoute that handles application errors and exceptions"""
+
+    # key: regex pattern for original error message from llama_cpp
+    # value: formatter function
+    pattern_and_formatters: Dict[
+        "Pattern",
+        Callable[
+            [
+                Union["CreateCompletionRequest", "CreateChatCompletionRequest"],
+                "Match[str]",
+            ],
+            Tuple[int, ErrorResponse],
+        ],
+    ] = {
+        compile(
+            r"Requested tokens \((\d+)\) exceed context window of (\d+)"
+        ): ErrorResponseFormatters.context_length_exceeded,
+        compile(
+            r"Model path does not exist: (.+)"
+        ): ErrorResponseFormatters.model_not_found,
+    }
+
+    def error_message_wrapper(
+        self,
+        error: Exception,
+        body: Optional[
+            Union[
+                "CreateChatCompletionRequest",
+                "CreateCompletionRequest",
+                "CreateEmbeddingRequest",
+            ]
+        ] = None,
+    ) -> Tuple[int, ErrorResponse]:
+        """Wraps error message in OpenAI style error response"""
+        print(f"Exception: {str(error)}", file=sys.stderr)
+        if body is not None and isinstance(
+            body,
+            (
+                CreateCompletionRequest,
+                CreateChatCompletionRequest,
+            ),
+        ):
+            # When text completion or chat completion
+            for pattern, callback in self.pattern_and_formatters.items():
+                match = pattern.search(str(error))
+                if match is not None:
+                    return callback(body, match)
+
+        # Wrap other errors as internal server error
+        return 500, ErrorResponse(
+            message=str(error),
+            type="internal_server_error",
+            param=None,
+            code=None,
+        )
+
+    def get_route_handler(
+        self,
+    ) -> Callable[[Request], Coroutine[None, None, Response]]:
+        """Defines custom route handler that catches exceptions and formats
+        in OpenAI style error response"""
+
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            try:
+                start_sec = time.perf_counter()
+                response = await original_route_handler(request)
+                elapsed_time_ms = int((time.perf_counter() - start_sec) * 1000)
+                response.headers["openai-processing-ms"] = f"{elapsed_time_ms}"
+                return response
+            except Exception as exc:
+                json_body = await request.json()
+                try:
+                    if "messages" in json_body:
+                        # Chat completion
+                        body: Optional[
+                            Union[
+                                CreateChatCompletionRequest,
+                                CreateCompletionRequest,
+                                CreateEmbeddingRequest,
+                            ]
+                        ] = CreateChatCompletionRequest(**json_body)
+                    elif "prompt" in json_body:
+                        # Text completion
+                        body = CreateCompletionRequest(**json_body)
+                    else:
+                        # Embedding
+                        body = CreateEmbeddingRequest(**json_body)
+                except Exception:
+                    # Invalid request body
+                    body = None
+
+                # Get proper error message from the exception
+                (
+                    status_code,
+                    error_message,
+                ) = self.error_message_wrapper(error=exc, body=body)
+                return JSONResponse(
+                    {"error": error_message},
+                    status_code=status_code,
+                )
+
+        return custom_route_handler
+
+
+router = APIRouter(route_class=RouteErrorHandler)
 
 settings: Optional[Settings] = None
 llama: Optional[llama_cpp.Llama] = None
@@ -103,7 +323,12 @@ llama: Optional[llama_cpp.Llama] = None
 def create_app(settings: Optional[Settings] = None):
     if settings is None:
         settings = Settings()
+
+    middleware = [
+        Middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(),))
+    ]
     app = FastAPI(
+        middleware=middleware,
         title="🦙 llama.cpp Python API",
         version="0.0.1",
     )
@@ -118,21 +343,27 @@ def create_app(settings: Optional[Settings] = None):
     global llama
     llama = llama_cpp.Llama(
         model_path=settings.model,
+        seed=settings.seed,
+        n_ctx=settings.n_ctx,
+        n_batch=settings.n_batch,
         n_gpu_layers=settings.n_gpu_layers,
+        main_gpu=settings.main_gpu,
         tensor_split=settings.tensor_split,
         rope_freq_base=settings.rope_freq_base,
         rope_freq_scale=settings.rope_freq_scale,
-        seed=settings.seed,
+        mul_mat_q=settings.mul_mat_q,
         f16_kv=settings.f16_kv,
-        use_mlock=settings.use_mlock,
-        use_mmap=settings.use_mmap,
-        embedding=settings.embedding,
         logits_all=settings.logits_all,
-        n_threads=settings.n_threads,
-        n_batch=settings.n_batch,
-        n_ctx=settings.n_ctx,
-        last_n_tokens_size=settings.last_n_tokens_size,
         vocab_only=settings.vocab_only,
+        use_mmap=settings.use_mmap,
+        use_mlock=settings.use_mlock,
+        embedding=settings.embedding,
+        n_threads=settings.n_threads,
+        last_n_tokens_size=settings.last_n_tokens_size,
+        lora_base=settings.lora_base,
+        lora_path=settings.lora_path,
+        numa=settings.numa,
+        chat_format=settings.chat_format,
         verbose=settings.verbose,
     )
     if settings.cache:
@@ -183,10 +414,34 @@ def get_settings():
     yield settings
 
 
-model_field = Field(description="The model to use for generating completions.", default=None)
+async def get_event_publisher(
+    request: Request,
+    inner_send_chan: MemoryObjectSendStream,
+    iterator: Iterator,
+):
+    async with inner_send_chan:
+        try:
+            async for chunk in iterate_in_threadpool(iterator):
+                await inner_send_chan.send(dict(data=json.dumps(chunk)))
+                if await request.is_disconnected():
+                    raise anyio.get_cancelled_exc_class()()
+                if settings.interrupt_requests and llama_outer_lock.locked():
+                    await inner_send_chan.send(dict(data="[DONE]"))
+                    raise anyio.get_cancelled_exc_class()()
+            await inner_send_chan.send(dict(data="[DONE]"))
+        except anyio.get_cancelled_exc_class() as e:
+            print("disconnected")
+            with anyio.move_on_after(1, shield=True):
+                print(f"Disconnected from client (via refresh/close) {request.client}")
+                raise e
+
+
+model_field = Field(
+    description="The model to use for generating completions.", default=None
+)
 
 max_tokens_field = Field(
-    default=16, ge=1, le=2048, description="The maximum number of tokens to generate."
+    default=16, ge=1, description="The maximum number of tokens to generate."
 )
 
 temperature_field = Field(
@@ -336,9 +591,9 @@ def make_logit_bias_processor(
                 to_bias[input_id] = score
 
     def logit_bias_processor(
-        input_ids: List[int],
-        scores: List[float],
-    ) -> List[float]:
+        input_ids: npt.NDArray[np.intc],
+        scores: npt.NDArray[np.single],
+    ) -> npt.NDArray[np.single]:
         new_scores = [None] * len(scores)
         for input_id, score in enumerate(scores):
             new_scores[input_id] = score + to_bias.get(input_id, 0.0)
@@ -351,6 +606,7 @@ def make_logit_bias_processor(
 @router.post(
     "/v1/completions",
 )
+@router.post("/v1/engines/copilot-codex/completions")
 async def create_completion(
     request: Request,
     body: CreateCompletionRequest,
@@ -370,39 +626,38 @@ async def create_completion(
     kwargs = body.model_dump(exclude=exclude)
 
     if body.logit_bias is not None:
-        kwargs['logits_processor'] = llama_cpp.LogitsProcessorList([
-            make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
-        ])
+        kwargs["logits_processor"] = llama_cpp.LogitsProcessorList(
+            [
+                make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
+            ]
+        )
 
-    if body.stream:
+    iterator_or_completion: Union[
+        llama_cpp.Completion, Iterator[llama_cpp.CompletionChunk]
+    ] = await run_in_threadpool(llama, **kwargs)
+
+    if isinstance(iterator_or_completion, Iterator):
+        # EAFP: It's easier to ask for forgiveness than permission
+        first_response = await run_in_threadpool(next, iterator_or_completion)
+
+        # If no exception was raised from first_response, we can assume that
+        # the iterator is valid and we can use it to stream the response.
+        def iterator() -> Iterator[llama_cpp.CompletionChunk]:
+            yield first_response
+            yield from iterator_or_completion
+
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
-
-        async def event_publisher(inner_send_chan: MemoryObjectSendStream):
-            async with inner_send_chan:
-                try:
-                    iterator: Iterator[llama_cpp.CompletionChunk] = await run_in_threadpool(llama, **kwargs)  # type: ignore
-                    async for chunk in iterate_in_threadpool(iterator):
-                        await inner_send_chan.send(dict(data=json.dumps(chunk)))
-                        if await request.is_disconnected():
-                            raise anyio.get_cancelled_exc_class()()
-                        if settings.interrupt_requests and llama_outer_lock.locked():
-                            await inner_send_chan.send(dict(data="[DONE]"))
-                            raise anyio.get_cancelled_exc_class()()
-                    await inner_send_chan.send(dict(data="[DONE]"))
-                except anyio.get_cancelled_exc_class() as e:
-                    print("disconnected")
-                    with anyio.move_on_after(1, shield=True):
-                        print(
-                            f"Disconnected from client (via refresh/close) {request.client}"
-                        )
-                        raise e
-
         return EventSourceResponse(
-            recv_chan, data_sender_callable=partial(event_publisher, send_chan)
-        ) # type: ignore
+            recv_chan,
+            data_sender_callable=partial(  # type: ignore
+                get_event_publisher,
+                request=request,
+                inner_send_chan=send_chan,
+                iterator=iterator(),
+            ),
+        )
     else:
-        completion: llama_cpp.Completion = await run_in_threadpool(llama, **kwargs)  # type: ignore
-        return completion
+        return iterator_or_completion
 
 
 class CreateEmbeddingRequest(BaseModel):
@@ -442,6 +697,14 @@ class ChatCompletionRequestMessage(BaseModel):
 class CreateChatCompletionRequest(BaseModel):
     messages: List[ChatCompletionRequestMessage] = Field(
         default=[], description="A list of messages to generate completions for."
+    )
+    functions: Optional[List[llama_cpp.ChatCompletionFunction]] = Field(
+        default=None,
+        description="A list of functions to apply to the generated completions.",
+    )
+    function_call: Optional[Union[str, llama_cpp.ChatCompletionFunctionCall]] = Field(
+        default=None,
+        description="A function to apply to the generated completions.",
     )
     max_tokens: int = max_tokens_field
     temperature: float = temperature_field
@@ -501,42 +764,38 @@ async def create_chat_completion(
     kwargs = body.model_dump(exclude=exclude)
 
     if body.logit_bias is not None:
-        kwargs['logits_processor'] = llama_cpp.LogitsProcessorList([
-            make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
-        ])
+        kwargs["logits_processor"] = llama_cpp.LogitsProcessorList(
+            [
+                make_logit_bias_processor(llama, body.logit_bias, body.logit_bias_type),
+            ]
+        )
 
-    if body.stream:
+    iterator_or_completion: Union[
+        llama_cpp.ChatCompletion, Iterator[llama_cpp.ChatCompletionChunk]
+    ] = await run_in_threadpool(llama.create_chat_completion, **kwargs)
+
+    if isinstance(iterator_or_completion, Iterator):
+        # EAFP: It's easier to ask for forgiveness than permission
+        first_response = await run_in_threadpool(next, iterator_or_completion)
+
+        # If no exception was raised from first_response, we can assume that
+        # the iterator is valid and we can use it to stream the response.
+        def iterator() -> Iterator[llama_cpp.ChatCompletionChunk]:
+            yield first_response
+            yield from iterator_or_completion
+
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
-
-        async def event_publisher(inner_send_chan: MemoryObjectSendStream):
-            async with inner_send_chan:
-                try:
-                    iterator: Iterator[llama_cpp.ChatCompletionChunk] = await run_in_threadpool(llama.create_chat_completion, **kwargs)  # type: ignore
-                    async for chat_chunk in iterate_in_threadpool(iterator):
-                        await inner_send_chan.send(dict(data=json.dumps(chat_chunk)))
-                        if await request.is_disconnected():
-                            raise anyio.get_cancelled_exc_class()()
-                        if settings.interrupt_requests and llama_outer_lock.locked():
-                            await inner_send_chan.send(dict(data="[DONE]"))
-                            raise anyio.get_cancelled_exc_class()()
-                    await inner_send_chan.send(dict(data="[DONE]"))
-                except anyio.get_cancelled_exc_class() as e:
-                    print("disconnected")
-                    with anyio.move_on_after(1, shield=True):
-                        print(
-                            f"Disconnected from client (via refresh/close) {request.client}"
-                        )
-                        raise e
-
         return EventSourceResponse(
             recv_chan,
-            data_sender_callable=partial(event_publisher, send_chan),
-        ) # type: ignore
-    else:
-        completion: llama_cpp.ChatCompletion = await run_in_threadpool(
-            llama.create_chat_completion, **kwargs  # type: ignore
+            data_sender_callable=partial(  # type: ignore
+                get_event_publisher,
+                request=request,
+                inner_send_chan=send_chan,
+                iterator=iterator(),
+            ),
         )
-        return completion
+    else:
+        return iterator_or_completion
 
 
 class ModelData(TypedDict):
