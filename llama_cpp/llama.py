@@ -1404,7 +1404,7 @@ class Llama:
 
     def create_completion(
         self,
-        prompt: str,
+        prompt: list,
         suffix: Optional[str] = None,
         max_tokens: int = 128,
         temperature: float = 0.8,
@@ -1479,7 +1479,7 @@ class Llama:
 
     def __call__(
         self,
-        prompt: str,
+        prompt: list,
         suffix: Optional[str] = None,
         max_tokens: int = 128,
         temperature: float = 0.8,
