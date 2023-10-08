@@ -1517,7 +1517,7 @@ static bool llama_eval_internal(
             offload_func_kq(KQ_scaled);
             ggml_set_name(KQ_scaled, "KQ_scaled");
 
-            // KQ_masked = mask_past(KQ_scaled)
+            
             struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, n_past);
             offload_func_kq(KQ_masked);
             ggml_set_name(KQ_masked, "KQ_masked");
