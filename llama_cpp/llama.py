@@ -1658,8 +1658,6 @@ class Llama:
         """
 
         stop = [] if stop is None else [stop] if isinstance(stop, str) else stop
-        rstop = result.stop if isinstance(result.stop, list) else [result.stop]
-        stop = stop + rstop
         PROMPT = []
         for message in messages:
             if message["role"] == "user":
